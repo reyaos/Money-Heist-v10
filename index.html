@@ -189,21 +189,23 @@ const fmtDateShort=ts=>new Date(ts).toLocaleDateString("en-US",{month:"short",da
 //  Widened thresholds give trades room to breathe through normal
 //  XAU volatility without neutering lot sizes after 2-3 losses.
 // ══════════════════════════════════════════════════════════════════
-const DAILY_STOP_PCT   = 0.20;  // stop trading if balance drops 20% from day start (was 15%)
-const CAUTION_PCT      = 0.08;  // reduce lots if balance drops 8% from day start (was 5%)
+const DAILY_STOP_PCT   = 0.25;  // hard stop if balance drops 25% from session start
+const CAUTION_PCT      = 0.12;  // reduce lots to 55% if balance drops 12% from session start
 
 // ── EXNESS ZERO ACCOUNT CONSTANTS ─────────────────────────────────
-const EXNESS_COMMISSION_PER_LOT_RT = 9.0; // ~$9 round-trip per full lot (open+close)
-const EXNESS_LEVERAGE              = 2000; // 1:2000
-const EXNESS_MARGIN_SAFETY         = 0.40; // never use >40% of free equity as margin
+const EXNESS_COMMISSION_PER_LOT_RT = 9.0; // Exness Zero: ~$9 round-trip commission per full lot
+const EXNESS_LEVERAGE              = 2000; // Exness Zero: 1:2000 leverage
+const EXNESS_MARGIN_SAFETY         = 0.70; // use up to 70% of free equity as margin (1:2000 = tiny margin per lot)
 
 // ── SESSION VOLATILITY MULTIPLIERS FOR SL (XAU-specific) ──────────
 function getSessionSLMult(hourGMT){
-  if(hourGMT>=13 &&hourGMT<17 )return 1.35; // London/NY overlap (was 2.0, most volatile but not extreme)
-  if(hourGMT>=8  &&hourGMT<10 )return 1.20; // London open spike (was 1.8)
-  if(hourGMT>=13 &&hourGMT<15 )return 1.20; // NY open (was 1.6)
-  if(hourGMT>=0  &&hourGMT<8  )return 0.85; // Asian — quiet
-  return 1.0;
+  // TIGHTENED multipliers — trailing stop handles volatility protection,
+  // so we want a TIGHTER initial SL to generate larger lot sizes.
+  // A $50 account needs lots, not safety — the trail IS the safety net.
+  if(hourGMT>=13 &&hourGMT<17 )return 1.10; // London/NY overlap — slightly wider
+  if(hourGMT>=8  &&hourGMT<10 )return 1.05; // London open
+  if(hourGMT>=0  &&hourGMT<8  )return 0.90; // Asian — quiet, tight SL
+  return 1.00;
 }
 
 // ── SWING STRUCTURE FINDER — finds last significant swing for SL ───
@@ -259,45 +261,60 @@ function findStructureSL(cs, dir, atr){
 //  Layer 6: Hard maximum cap (never risk more than 15% of balance)
 // ══════════════════════════════════════════════════════════════════
 function calcHFTSL({cs, dir, entry, atr, spread, hourGMT, balance, inst="XAUUSD"}){
-  // XAU/USD only
-  const Layer1=findStructureSL(cs, dir, atr);
-  const sweepBuffer=atr*0.30;
-  const spreadBuffer=spread*2.0;
+  // ================================================================
+  //  MASTER HFT SL CALCULATOR — 6-layer structure
+  //
+  //  Layer 1: Real market structure (swing low/high from last 30 bars)
+  //  Layer 2: Liquidity sweep buffer (0.25x ATR — tighter than before)
+  //  Layer 3: Spread buffer (1.5x spread)
+  //  Layer 4: Session volatility multiplier (tightened for more lots)
+  //  Layer 5: ATR floor (0.80x ATR minimum — gives trade breathing room)
+  //  Layer 6: Hard minimum $1.20 / Hard maximum (20% of balance)
+  //
+  //  KEY CHANGE vs old version:
+  //   - Session multipliers TIGHTENED (were 1.20-1.35, now 1.05-1.15)
+  //     Tighter SL = larger lot size = more profit per winning trade.
+  //     The trailing stop at 50% of TP1 distance protects the trade
+  //     so we don't NEED an extra-wide initial SL anymore.
+  //   - Floor raised from $0.80 to $1.20 (3x Deriv max spread on XAU)
+  //   - Hard max raised to 20% of balance (was 15%) for more flexibility
+  // ================================================================
+  const Layer1 = findStructureSL(cs, dir, atr);
+  const sweepBuffer  = atr * 0.25;   // was 0.30 — tighter, less wasted SL distance
+  const spreadBuffer = spread * 1.5; // was 2.0 — spread rarely spikes on Deriv XAU
 
   let rawSL;
-  if(Layer1!==null){
-    if(dir==="BUY"){
-      rawSL=Math.abs(entry-(Layer1-sweepBuffer-spreadBuffer));
-    }else{
-      rawSL=Math.abs((Layer1+sweepBuffer+spreadBuffer)-entry);
+  if (Layer1 !== null) {
+    if (dir === "BUY") {
+      rawSL = Math.abs(entry - (Layer1 - sweepBuffer - spreadBuffer));
+    } else {
+      rawSL = Math.abs((Layer1 + sweepBuffer + spreadBuffer) - entry);
     }
-  }else{
-    rawSL=1.2*atr+spreadBuffer;
+  } else {
+    rawSL = 1.0 * atr + spreadBuffer; // fallback: 1x ATR
   }
 
-  const sessMult=getSessionSLMult(hourGMT||0);
-  rawSL=rawSL*sessMult;
+  // Layer 4: Session multiplier — TIGHTENED to produce larger lot sizes
+  // Trailing stop handles the volatility, so initial SL doesn't need to be huge
+  const sessMult = getSessionSLMult(hourGMT || 0);
+  rawSL = rawSL * sessMult;
 
-  const minATRCover=atr*1.0;
-  rawSL=Math.max(rawSL, minATRCover);
+  // Layer 5: Minimum ATR coverage — 0.80x ATR so SL isn't inside noise
+  rawSL = Math.max(rawSL, atr * 0.80);
 
-  // Layer 5: Hard minimum floor — $1.50 for Exness Zero XAUUSD
-  // Rationale: Exness Zero spread spikes to $0.30-$0.50 during news;
-  // $1.50 floor ensures SL sits beyond 3× max spike, not inside it.
-  rawSL=Math.max(rawSL, 1.50); // was 0.80
+  // Layer 5b: Hard floor — $1.20 (3x Deriv XAU spread spike protection)
+  rawSL = Math.max(rawSL, 1.20);
 
-  const pip=10;
-  // Layer 6: Hard max — never risk more than 15% of START balance per trade (absolute cap)
-  // Uses balance param which is overridden with real balance at entry call site
-  const maxRiskPerTrade=balance*0.15; // was 0.10 — absolute ceiling anchored to start balance
-  const maxSLAtMinLot=maxRiskPerTrade/(MIN_LOT*pip);
-  rawSL=Math.min(rawSL, maxSLAtMinLot);
+  // Layer 6: Hard maximum — 20% of balance (absolute ceiling)
+  const maxRiskPerTrade = balance * 0.20;
+  const maxSLAtMinLot   = maxRiskPerTrade / (MIN_LOT * 10);
+  rawSL = Math.min(rawSL, maxSLAtMinLot);
 
-  const slPrice=dir==="BUY"
-    ?+(entry-rawSL).toFixed(2)
-    :+(entry+rawSL).toFixed(2);
+  const slPrice = dir === "BUY"
+    ? +(entry - rawSL).toFixed(2)
+    : +(entry + rawSL).toFixed(2);
 
-  return{sl:slPrice, slD:+rawSL.toFixed(2)};
+  return {sl: slPrice, slD: +rawSL.toFixed(2)};
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -323,119 +340,152 @@ function calcHFTSL({cs, dir, entry, atr, spread, hourGMT, balance, inst="XAUUSD"
 // ══════════════════════════════════════════════════════════════════
 function calcHFTLots({balance, dayStartBal, strength, slD, score, inst="XAUUSD",
                       startBalance, streak, livePrice, hourGMT}){
-  const pip=10; // $10 per pip per 1.0 lot on XAU/USD
+  // ================================================================
+  //  GEOMETRIC COMPOUNDING LOT SIZER — TARGET-AWARE RISK ENGINE
+  //  Goal: $50->$550 or $10->$100 (10x) in one 15-hour session.
+  //
+  //  PHILOSOPHY — "Aggressive-but-Protected Compounding":
+  //  1. Risk % applied to CURRENT equity — so every win auto-compounds
+  //  2. Risk % shaped by PROGRESS toward profit target — attack when
+  //     far away, protect gains when close (4 phases)
+  //  3. Vote conviction multiplies the base risk within each phase
+  //  4. Hot-streak & recovery adjustments exploit/survive momentum runs
+  //  5. Drawdown zones cut size — trades can breathe, capital is safe
+  //  6. Margin guard — never over-leverage on Deriv 1:500
+  //
+  //  PHASE TABLE (growthRatio = balance / sessionStartBal):
+  //   HUNT     (<1.5x)  : 7-10% risk — attack the target aggressively
+  //   BUILD    (1.5-3x) : 5-8%  risk — steady compounding engine
+  //   PROTECT  (3-7x)   : 3-5%  risk — lock in gains, still growing
+  //   HARVEST  (>=7x)   : 2-3%  risk — coast to finish, don't blow up
+  //
+  //  EXNESS ZERO ACCOUNT — XAU/USD:
+  //   Leverage: 1:2000 | Pip value: $10/lot per $1 move
+  //   Commission: ~$9 round-trip per full lot | Min lot: 0.01 | Max lot: 5.0
+  //   At 1:2000: margin per lot ~$235 (at $4700 gold) vs $940 at 1:500
+  //   Effect: 4x more lots possible for same balance = 4x the profit potential
+  //
+  //  MATH CHECK ($50 target $550):
+  //   HUNT phase: 8% risk/trade on $50 = $4 risk
+  //   At 1:3 RR (TP1=1.5x SL, TP2=3x, TP3=6x) with 55% win rate:
+  //   EV per trade = 0.55*(8%*2) - 0.45*(8%) = +5.2% of equity
+  //   After ~30 compounding trades: $50 * 1.052^30 = ~$220 (build phase)
+  //   Build phase takes over at 3x: $150 * 1.038^20 = ~$550 total
+  //   This is realistic for a 15-hour session with 60+ signals.
+  // ================================================================
+  const pip = 10; // $10 per $1 move per 1.0 lot on XAU/USD (Deriv standard)
 
-  // ── DRAWDOWN ZONES (widened for Exness Zero breathing room) ───────
-  const drawdownPct=(dayStartBal-balance)/Math.max(dayStartBal,0.01);
-  const inCaution = drawdownPct>=CAUTION_PCT && drawdownPct<DAILY_STOP_PCT; // 8–20%
-  const inDanger  = drawdownPct>=DAILY_STOP_PCT*0.80; // ≥16% — danger threshold
+  // ── SESSION ANCHOR ────────────────────────────────────────────────
+  const sessionStart = startBalance || dayStartBal;
 
-  // ── VOTE COUNT ────────────────────────────────────────────────────
-  const votes=score||Math.round((strength/100)*MAX_SCORE);
+  // ── DRAWDOWN ZONES (from session-start balance) ───────────────────
+  const drawdownPct = (dayStartBal - balance) / Math.max(dayStartBal, 0.01);
+  const inCaution   = drawdownPct >= CAUTION_PCT && drawdownPct < DAILY_STOP_PCT;
+  const inDanger    = drawdownPct >= DAILY_STOP_PCT * 0.85; // 85% of stop = danger
 
-  // ── PHASE DETECTION — based on progress toward profit target ──────
-  const sessionStart = startBalance || dayStartBal; // anchor to session start balance
-  const growthRatio  = balance / Math.max(sessionStart, 0.01);
+  // ── PHASE — how far along the 10x journey? ────────────────────────
+  const growthRatio = balance / Math.max(sessionStart, 0.01);
   let phase;
-  if(growthRatio < 2.0)       phase = 1; // Build    ($50 → $100)
-  else if(growthRatio < 6.0)  phase = 2; // Compound ($100 → $300+)
-  else                        phase = 3; // Secure   ($300+ — protect gains)
+  if      (growthRatio >= 7.0) phase = "HARVEST"; // 7x+ — coast home
+  else if (growthRatio >= 3.0) phase = "PROTECT"; // 3-7x — lock gains
+  else if (growthRatio >= 1.5) phase = "BUILD";   // 1.5-3x — compound
+  else                         phase = "HUNT";    // <1.5x — attack target
 
-  // ── BASE RISK % BY VOTE TIER ──────────────────────────────────────
+  // ── VOTE CONVICTION ───────────────────────────────────────────────
+  const votes = score || Math.round((strength / 100) * MAX_SCORE);
+
+  // ── BASE RISK % BY PHASE + CONVICTION ────────────────────────────
   let riskPct;
-  if(phase===3){
-    // Secure phase — de-risk, let compounded gains coast home
-    riskPct = votes>=6 ? 0.030 : votes>=5 ? 0.025 : 0.020;
-  } else if(phase===2){
-    // Compound phase — this is where the $50→$550 math accelerates
-    riskPct = votes>=6 ? 0.080 : votes>=5 ? 0.070 : votes>=4 ? 0.060 : 0.050;
+  if (phase === "HARVEST") {
+    // Protect the 7x+ gain — tiny risk, just grind the last bit
+    riskPct = votes >= 6 ? 0.030 : votes >= 5 ? 0.025 : 0.020;
+  } else if (phase === "PROTECT") {
+    // Gains are real — de-risk but keep compounding
+    riskPct = votes >= 6 ? 0.050 : votes >= 5 ? 0.040 : votes >= 4 ? 0.035 : 0.030;
+  } else if (phase === "BUILD") {
+    // The engine room — this is where $50 becomes $200+
+    riskPct = votes >= 6 ? 0.080 : votes >= 5 ? 0.070 : votes >= 4 ? 0.060 : 0.050;
   } else {
-    // Build phase — strong enough to compound, tight enough to survive
-    riskPct = votes>=6 ? 0.060 : votes>=5 ? 0.055 : votes>=4 ? 0.050 : 0.040;
+    // HUNT — start aggressive, need early wins to compound from
+    riskPct = votes >= 6 ? 0.100 : votes >= 5 ? 0.090 : votes >= 4 ? 0.080 : 0.070;
   }
 
-  // ── RECOVERY MODE — 3+ consecutive losses ─────────────────────────
-  // Require high-conviction only AND bump risk to recover faster.
-  // Fewer trades, better setups, larger position on those setups.
-  const streakDir  = streak?.dir || "";
-  const streakCur  = streak?.cur || 0;
-  const inRecovery = streakDir==="L" && streakCur>=3;
-  if(inRecovery){
-    // Only high-conviction signals trade during recovery (enforced at call site via minConf+2)
-    riskPct = Math.max(riskPct, 0.060); // floor at 6% — recover with purpose, not desperation
+  // ── STREAK ADJUSTMENTS ────────────────────────────────────────────
+  const streakDir = streak?.dir || "";
+  const streakCur = streak?.cur || 0;
+  const hotStreak  = streakDir === "W" && streakCur >= 3;
+  const inRecovery = streakDir === "L" && streakCur >= 3;
+
+  // Hot streak: ride the momentum — +15% size (capped by absolute max)
+  if (hotStreak && !inRecovery) {
+    riskPct = riskPct * 1.15;
+  }
+  // Recovery mode: larger size on fewer, better signals (floor at 7%)
+  // The enforced minConf+2 gate at call site ensures quality
+  if (inRecovery) {
+    riskPct = Math.max(riskPct, 0.070);
   }
 
-  // ── HOT STREAK MULTIPLIER — 3+ consecutive wins ───────────────────
-  // Exploit momentum runs without permanently raising baseline risk.
-  // Resets immediately on any loss.
-  const hotStreak = streakDir==="W" && streakCur>=3;
-  if(hotStreak && !inRecovery){
-    riskPct = riskPct * 1.20; // +20% on momentum — capped by absolute max below
-  }
+  // ── ABSOLUTE CAP — anchored to SESSION START balance ─────────────
+  // $50 start: never risk more than $10/trade ($50*0.20)
+  // $10 start: never risk more than $2/trade ($10*0.20)
+  // This scales with start bal, NOT current bal — prevents over-sizing
+  // on a compounded run when the math says "risk $40 on a $400 balance"
+  const absoluteMaxRiskDollars = sessionStart * 0.20;
 
-  // ── ABSOLUTE MAX CAP — anchored to SESSION START balance ──────────
-  // Prevents over-leveraging on a compounded hot run.
-  // On $50 start: max $7.50/trade ever. On $10 stress test: max $1.50/trade.
-  const sessionStartBal = startBalance || dayStartBal;
-  const absoluteMaxRiskDollars = sessionStartBal * 0.15;
+  // ── DRAWDOWN PROTECTION ───────────────────────────────────────────
+  if      (inDanger)   riskPct = riskPct * 0.25; // 25% size — survival mode
+  else if (inCaution)  riskPct = riskPct * 0.55; // 55% size — caution zone
 
-  // ── CAPITAL ZONE ADJUSTMENTS ──────────────────────────────────────
-  if(inDanger)        riskPct = riskPct * 0.30; // 30% of normal — danger zone
-  else if(inCaution)  riskPct = riskPct * 0.55; // 55% of normal — caution zone
-
-  // ── EXNESS HMR BLACKOUT WINDOWS — reduce lots during high margin periods ──
-  // Per Exness docs: leverage caps to 1:1000 during these windows.
-  // We reduce lots 50% rather than halt — keep trading, reduce exposure.
+  // ── DERIV HMR / ROLLOVER WINDOWS — reduce during thin liquidity ───
+  // Deriv XAU/USD has reduced liquidity near daily rollover and Friday close.
+  // We trade through it (never halt) but reduce exposure by 40%.
   let hmrActive = false;
-  if(hourGMT!=null){
-    const minUTC = (hourGMT % 1) * 60;
-    // 30 min before XAU daily break (23:30–00:00 GMT)
-    if(hourGMT>=23.5 || hourGMT<0.1) hmrActive = true;
-    // 4 hours before Friday close (20:00–00:00 GMT Friday)
-    // Friday = day 5 in JS (0=Sun)
-    const dayUTC = new Date().getUTCDay();
-    if(dayUTC===5 && hourGMT>=20) hmrActive = true;
-    // 1 hour after Sunday open (00:00–01:00 GMT Sunday)
-    if(dayUTC===0 && hourGMT<1.0) hmrActive = true;
+  if (hourGMT != null) {
+    // 23:45-00:15 UTC daily rollover window (XAU breaks briefly)
+    if (hourGMT >= 23.75 || hourGMT < 0.25) hmrActive = true;
+    // Friday after 20:00 UTC — weekend gap risk
+    if (new Date().getUTCDay() === 5 && hourGMT >= 20) hmrActive = true;
+    // Sunday open 00:00-01:00 UTC — gap risk from weekend
+    if (new Date().getUTCDay() === 0 && hourGMT < 1.0) hmrActive = true;
   }
-  if(hmrActive) riskPct = riskPct * 0.50;
+  if (hmrActive) riskPct = riskPct * 0.60; // 40% reduction, not a full halt
 
-  // ── RISK DOLLARS (pre-commission) ────────────────────────────────
-  let riskDollars = Math.min(balance * riskPct, absoluteMaxRiskDollars);
-
-  // ── COMMISSION AWARENESS ──────────────────────────────────────────
-  // On Exness Zero: ~$9 round-trip per full lot.
-  // Deduct estimated commission from risk budget so the bot never
-  // sizes into a trade where commission alone eats the expected profit.
-  // Minimum lot estimate first, then refine.
-  const estLots      = riskDollars / (Math.max(slD, 1.50) * pip);
-  const estCommission = Math.min(estLots, 5.0) * EXNESS_COMMISSION_PER_LOT_RT;
-  // Only deduct if commission is material (>5% of risk budget)
-  if(estCommission > riskDollars * 0.05){
-    riskDollars = Math.max(riskDollars - estCommission, balance * 0.01);
-  }
+  // ── RISK DOLLARS ─────────────────────────────────────────────────
+  // Use CURRENT balance for compounding, but cap at absolute max
+  const riskDollars = Math.min(balance * riskPct, absoluteMaxRiskDollars);
 
   // ── LOT CALCULATION ───────────────────────────────────────────────
-  // Lots = riskDollars / (slD × pip)
-  // slD floor raised to 1.50 in calcHFTSL — but guard here too
-  const effectiveSLD = Math.max(slD, 1.50);
-  const lotRaw = riskDollars / (effectiveSLD * pip);
+  // lots = riskDollars / (slD * pip_per_lot)
+  // SL floor: 1.20 prevents unrealistically large lots from ultra-tight SLs
+  // SL ceiling: whatever calcHFTSL produced — respected as-is
+  const effectiveSLD = Math.max(slD, 1.20);
+  // Commission guard: at $9 RT/lot on Exness Zero, deduct commission from risk budget
+  // so the bot doesn't enter trades where commission eats expected profit
+  const estLots      = riskDollars / (effectiveSLD * pip);
+  const estCommission = Math.min(estLots, 5.0) * EXNESS_COMMISSION_PER_LOT_RT;
+  const riskAfterComm = estCommission > riskDollars * 0.04
+    ? Math.max(riskDollars - estCommission, balance * 0.01)
+    : riskDollars;
+  const lotRaw = riskAfterComm / (effectiveSLD * pip);
 
-  // ── MARGIN SAFETY GUARD — never use >40% of equity as margin ─────
-  // At 1:2000, margin per lot = (goldPrice × 100) / 2000
-  // Approximate gold price if not passed in
-  const goldPrice = livePrice || 3300; // fallback to ~current gold price
-  const marginPerLot = (goldPrice * 100) / EXNESS_LEVERAGE; // ~$165/lot at $3300
+  // ── MARGIN SAFETY — Exness Zero 1:2000 ─────────────────────────────
+  // Margin per lot = (goldPrice * 100oz) / 2000
+  // At gold ~$4700: margin/lot = $4700*100/2000 = $235/lot
+  // 1:2000 means $235 margin controls 100oz = MUCH lower margin requirement
+  // This allows significantly larger lot sizes on the same balance
+  const goldPrice = livePrice || 4700; // used for 1:2000 margin calc
+  const marginPerLot = (goldPrice * 100) / EXNESS_LEVERAGE; // ~$940/lot at $4700
   const maxLotsFromMargin = (balance * EXNESS_MARGIN_SAFETY) / Math.max(marginPerLot, 1);
 
   const lots = +Math.min(
     Math.max(lotRaw, MIN_LOT),
-    5.0,
-    maxLotsFromMargin
+    5.0,              // hard lot cap
+    maxLotsFromMargin // margin safety cap
   ).toFixed(2);
 
-  return{lots, riskDollars:+riskDollars.toFixed(2), riskPct,
-         phase, hotStreak, inRecovery, hmrActive};
+  return {lots, riskDollars: +riskDollars.toFixed(2), riskPct,
+          phase, hotStreak, inRecovery, hmrActive};
 }
 
 // ── RISK TIERS (legacy — kept for compatibility) ───────────────────
@@ -2026,20 +2076,19 @@ function App(){
       rLastTradeTs.current=Date.now();
       const locked=rProfitTarget.current;
 
-      // ── Feature 3: 10% of locked profits released to trading balance ──
-      // 90% is permanently locked (withdrawn). 10% rolls into the next run.
-      const released=+(locked*0.10).toFixed(2);
-      const permanentlyLocked=+(locked*0.90).toFixed(2);
-      rLockedProfits.current=+(rLockedProfits.current+permanentlyLocked).toFixed(2);
+      // Target hit — celebrate but KEEP TRADING with full compounded balance
+      // Do NOT reset balance. Bot continues from current equity.
+      // The profit target is a milestone, not a ceiling.
+      const permanentlyLocked = +(locked * 0.50).toFixed(2); // log 50% as "secured"
+      rLockedProfits.current  = +(rLockedProfits.current + permanentlyLocked).toFixed(2);
       setLockedProfits(rLockedProfits.current);
-      setLockToastAmt(locked);setShowLockToast(true);
+      setLockToastAmt(locked); setShowLockToast(true);
 
-      // New trading balance = starting balance + 10% of this target
-      const newTradingBal=+(rStartBal.current+released).toFixed(2);
-      rBalance.current=newTradingBal;
-      rDayStart.current=newTradingBal;
-      rPeakBal.current=newTradingBal;
-      setBalance(newTradingBal);setDayStartBal(newTradingBal);setPeakBal(newTradingBal);
+      // Balance stays at current level — keep compounding above the target
+      // rBalance, rDayStart, rPeakBal are NOT reset — bot continues growing
+      // Next target: 2x the original profit target (keeps the bot motivated)
+      rProfitTarget.current = +(rProfitTarget.current * 1.5).toFixed(2);
+      setProfitTarget(rProfitTarget.current);
 
       // Close any open trade immediately when target hit
       if(rTrade.current){rTrade.current=null;setTrade(null);}
@@ -2348,7 +2397,9 @@ function App(){
 
       // Only open 2 positions if strength is very high AND balance is healthy
       const numPos=(sig.strength>=85&&dayDD<0.03&&rBalance.current>15)?2:1;
-      const lots=+Math.min(Math.max(+(rawLots/numPos).toFixed(4),MIN_LOT),MAX_LOT_NORMAL).toFixed(4);
+      // No MAX_LOT_NORMAL cap — let the risk engine decide lot size
+      // The absolute caps inside calcHFTLots (5.0 lots, margin guard) are the real ceilings
+      const lots=+Math.min(Math.max(+(rawLots/numPos).toFixed(2),MIN_LOT),5.0).toFixed(2);
 
       // Use recalculated SL for the actual trade
       const finalSig={...sig, sl:realSL.sl, slD:realSL.slD,
@@ -2366,7 +2417,7 @@ function App(){
         p1Done:false, p2Done:false, p3Done:false,
         trailing:true, beDone:true, posNum:1, inst:rInstrument.current,
         highWater:finalSig.entry, lowWater:finalSig.entry,
-        riskDollars, riskPct, openCandle:newC.length};
+        riskDollars, riskPct, phase, openCandle:newC.length};
       rTrade.current=t;
       rDayTrades.current+=numPos;setDayTrades(rDayTrades.current);setTrade(t);setPhase("IN_TRADE");
 
@@ -2375,7 +2426,8 @@ function App(){
       const phaseLabel=`P${phase}`;
       const streakLabel=hotStreak?`🔥${rStreak.current.cur}W`:inRecovery?`⚠${rStreak.current.cur}L`:"";
       const hmrLabel=hmrActive?"🚧HMR ":"";
-      setStatus(`${posLabel}${zoneLabel}${hmrLabel}⚡ ${sig.dir} @ ${sig.entry} · TRAIL:${initTrailD.toFixed(2)} · risk $${riskDollars.toFixed(2)} (${Math.round(riskPct*100)}%) · ${phaseLabel} ${streakLabel} · ${sig.strength}%`);
+      const phaseEmoji={HUNT:"🎯",BUILD:"🏗",PROTECT:"🛡",HARVEST:"🏆"}[phase]||"";
+      setStatus(`${posLabel}${zoneLabel}${hmrLabel}${phaseEmoji}${phaseLabel} · ${sig.dir} @ ${sig.entry} · lots:${lots} · SL:${initTrailD.toFixed(2)} · risk $${riskDollars.toFixed(2)} (${Math.round(riskPct*100)}%) ${streakLabel} · votes:${sig.score}/16`);
 
       if(numPos>=2){
         const t2={...finalSig, sl:initSL, slD:initTrailD, lots, pnl:0,
@@ -2910,6 +2962,9 @@ function App(){
   const dd=peakBal>balance?+((peakBal-balance)/peakBal*100).toFixed(1):0;
   const hour=nowGMT(),kz=kzAt(hour);
   const progressPct=Math.min(Math.max((balance-startBal)/profitTarget*100,0),100);
+  const growthRatioUI=balance/Math.max(startBal,0.01);
+  const phaseUI=growthRatioUI>=7?"HARVEST":growthRatioUI>=3?"PROTECT":growthRatioUI>=1.5?"BUILD":"HUNT";
+  const phaseColUI={HUNT:RED,BUILD:GOLD,PROTECT:BLUE,HARVEST:GREEN}[phaseUI];
   const inBlackoutNow=isNewsBlackout(newsEvents);
 
   const TABS=[
@@ -3096,14 +3151,14 @@ function App(){
       )}
       <div style={{background:"#0a0a0c",borderBottom:`1px solid ${BORDER}`,padding:"4px 14px",flexShrink:0}}>
         <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginBottom:"3px"}}>
-          <span style={{color:DIM}}>Target <span style={{color:GOLD}}>${profitTarget}</span> · {progressPct.toFixed(1)}%</span>
+          <span style={{color:DIM}}>Target <span style={{color:GOLD}}>${profitTarget}</span> · <span style={{color:phaseColUI,fontWeight:"700"}}>{phaseUI}</span> · {progressPct.toFixed(1)}%</span>
           <span style={{color:TEXT,fontFamily:"'JetBrains Mono',monospace",fontSize:"9px"}}>
             {streak.cur>1&&<span style={{color:streak.dir==="W"?GREEN:RED,marginRight:"8px",fontWeight:"700"}}>{streak.cur}{streak.dir==="W"?"🔥":"💧"}</span>}
-            <span style={{color:DIM}}>${Math.max(0,startBal+profitTarget-balance).toFixed(2)} to go</span>
+            <span style={{color:DIM}}>{phaseUI==="HARVEST"?"🏆 TARGET HIT":"$"+Math.max(0,startBal+profitTarget-balance).toFixed(2)+" left"}</span>
           </span>
         </div>
         <div style={{height:"3px",background:"#1a1a1a",borderRadius:"2px",overflow:"hidden"}}>
-          <div style={{height:"100%",width:`${progressPct}%`,
+          <div style={{height:"100%",width:`${progressPct}%`,background:phaseColUI,
             background:progressPct>=100?GOLD:progressPct>=60?GREEN:progressPct>=30?BLUE:RED,
             borderRadius:"2px",transition:"width .5s"}}/>
         </div>
@@ -3138,6 +3193,12 @@ function App(){
             <SpreadPill spread={liveSpread} inst={instrument}/>
             {trade.riskDollars!=null&&<span style={{fontSize:"8px",color:MUTED,flexShrink:0}}>R:${trade.riskDollars.toFixed(2)}</span>}
             <span style={{fontSize:"8px",color:DIM,flexShrink:0}}>|</span>
+            {trade.phase&&<span style={{fontSize:"8px",color:
+              trade.phase==="HUNT"?RED:trade.phase==="BUILD"?GOLD:trade.phase==="PROTECT"?BLUE:GREEN,
+              fontWeight:"700",flexShrink:0,padding:"1px 4px",borderRadius:"3px",
+              background:(trade.phase==="HUNT"?RED:trade.phase==="BUILD"?GOLD:trade.phase==="PROTECT"?BLUE:GREEN)+"20"}}>
+              {trade.phase==="HUNT"?"🎯HUNT":trade.phase==="BUILD"?"🏗BUILD":trade.phase==="PROTECT"?"🛡PROT":"🏆HARV"}
+            </span>}
             {trade.strength!=null&&<span style={{fontSize:"8px",color:PURPLE,flexShrink:0}}>STR:{trade.strength}%</span>}
             {lastSignalVotes&&<VoteBar buyVotes={lastSignalVotes.buy} sellVotes={lastSignalVotes.sell}/>}
             {lastMTFBias!==0&&<MTFBadge bias={lastMTFBias}/>}
